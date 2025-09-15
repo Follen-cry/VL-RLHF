@@ -3,7 +3,11 @@ import torch
 from transformers import Trainer
 from deepspeed import zero
 from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
-from transformers import deepspeed
+try:
+    from transformers.integrations.deepspeed import HfDeepSpeedConfig
+except Exception:
+    # fallback for older Transformers (<4.56)
+    from transformers.deepspeed import HfDeepSpeedConfig 
 from trl import PPOTrainer
 import os
 

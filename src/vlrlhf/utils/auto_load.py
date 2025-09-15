@@ -25,7 +25,13 @@ from torch.nn.modules import Module
 from torch.optim.lr_scheduler import _LRScheduler, LambdaLR
 from torch.optim.optimizer import Optimizer as Optimizer
 from peft import LoraConfig
-from transformers import GPTQConfig, deepspeed
+from transformers import GPTQConfig
+try:
+    from transformers.integrations.deepspeed import HfDeepSpeedConfig
+except Exception:
+    # fallback for older Transformers (<4.56)
+    from transformers.deepspeed import HfDeepSpeedConfig  # type: ignore
+
 from transformers import (
     TrainingArguments,
 )
@@ -37,6 +43,7 @@ from peft import PeftModel
 import torch
 from loguru import logger
 from importlib import import_module
+from vlrlhf.rewards.numeric_closeness import NumericClosenessRewarder
 
 MODEL_NICKNAME_MAP = {
     "LlavaForConditionalGeneration": "Llava",
@@ -45,6 +52,7 @@ MODEL_NICKNAME_MAP = {
     "InstructBlipForRL": "InstructBlip",
     "LlavaNextForConditionalGeneration": "LlavaNext",
     "InternLMXComposer2ForCausalLM": "InternLMXC2",
+    "Qwen2_5_VLForConditionalGeneration": "QwenVL",
 }
 FLASH_ATTN_MODELS = [
     "LlavaForConditionalGeneration",
@@ -55,6 +63,22 @@ FLASH_ATTN_MODELS = [
     "InternLMXComposer2ForCausalLM",
 ]
 
+def build_rewarder_from_args(reward_type: Optional[str], reward_args) -> Optional[callable]:
+    """
+    Returns a callable rewarder or None.
+    - If reward_type == 'numeric_closeness', returns NumericClosenessRewarder(...)
+    - Else, return None (caller can load a model-based reward).
+    """
+    if reward_type is None:
+        return None
+    if reward_type == "numeric_closeness":
+        return NumericClosenessRewarder(
+            metric=reward_args.reward_metric,
+            scale=reward_args.reward_scale,
+            parser=reward_args.reward_parser,
+            penalty_no_number=reward_args.reward_penalty_no_number,
+        )
+    raise ValueError(f"Unknown reward_type: {reward_type}")
 
 def auto_core_mapper(architecture):
     module_name = f".{MODEL_NICKNAME_MAP[architecture]}"
@@ -97,10 +121,11 @@ class MyAutoRewardModel:
     @staticmethod
     @wraps(AutoModelForCausalLM.from_pretrained)
     def from_pretrained(model_name_or_path, *model_args, **kwargs) -> PreTrainedModel:
+        trust_remote_code = kwargs.pop("trust_remote_code", True)
         config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
         architecture = config.architectures[0]
         return auto_core_mapper(architecture).reward_model.from_pretrained(
-            model_name_or_path, trust_remote_code=True, *model_args, **kwargs
+            model_name_or_path, trust_remote_code=trust_remote_code, *model_args, **kwargs
         )
 
 
@@ -108,10 +133,11 @@ class MyAutoModelWithValueHead:
     @staticmethod
     @wraps(VLModelWithValueHead.from_pretrained)
     def from_pretrained(model_name_or_path, *model_args, **kwargs) -> PreTrainedModel:
-        config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
+        trust_remote_code = kwargs.pop("trust_remote_code", True)
+        config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=trust_remote_code)
         architecture = config.architectures[0]
         return auto_core_mapper(architecture).value_model.from_pretrained(
-            model_name_or_path, trust_remote_code=True, *model_args, **kwargs
+            model_name_or_path, trust_remote_code=trust_remote_code, *model_args, **kwargs
         )
 
 
@@ -170,7 +196,49 @@ class MyAutoRMCollator(VLRMDataCollatorWithPadding):
         pad_token_id: int = 0,
     ): ...
 
+# src/vlrlhf/utils/auto_load.py (or wherever MyAutoPPOCollator lives)
+from transformers import AutoConfig
+import torch
 
+class MyAutoPPOCollator:
+    """
+    Wrapper around the repo's architecture-specific collator that
+    preserves extra fields needed by the rewarder:
+      - targets: 1D float tensor
+      - image:   list[str] relative paths (e.g. "Aesthetics/0001.jpg") for task inference
+      - img_path:list[str] absolute paths (if you need later)
+    """
+    def __init__(self, model_name_or_path: str):
+        config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
+        architecture = config.architectures[0]
+        base_collator_cls = auto_core_mapper(architecture).ppo_collator
+        self.base = base_collator_cls()  # the original collator
+
+    def __call__(self, examples):
+        # Call the original collator to build tensors the model expects
+        batch = self.base(examples)
+
+        # Inject extra fields for the rewarder (assumes your dataset provides these keys)
+        # Prefer a normalized target field; fall back to existing names if needed.
+        if "target_value" in examples[0]:
+            targets = [float(ex["target_value"]) for ex in examples]
+        elif "target" in examples[0]:
+            targets = [float(ex["target"]) for ex in examples]
+        else:
+            targets = [float(ex["score"]) for ex in examples]  # your original field
+
+        batch["targets"]  = torch.tensor(targets, dtype=torch.float32)
+
+        # Relative path for task inference from the path prefix
+        batch["image"]    = [ex.get("rel_path", ex.get("image")) for ex in examples]
+
+        # Absolute path if you still need it somewhere else (optional)
+        if "img_path" in examples[0]:
+            batch["img_path"] = [ex["img_path"] for ex in examples]
+
+        return batch
+
+'''
 class MyAutoPPOCollator(VLPPODataCollator):
     def __new__(
         cls,
@@ -185,7 +253,7 @@ class MyAutoPPOCollator(VLPPODataCollator):
         self,
         model_name_or_path: str,
     ): ...
-
+'''
 
 class MyAutoDPOTrainer(VLDPOTrainer):
     def __new__(

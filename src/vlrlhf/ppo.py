@@ -11,19 +11,33 @@ from vlrlhf.utils.auto_load import (
     MyAutoModelWithValueHead,
     MyAutoPPOTrainer,
     MyAutoRewardModel,
-    MyAutoPPOCollator,
-    MyAutoGenerationConfig,
+    MyAutoPPOCollator
 )
-from vlrlhf.utils.common import get_vision_tower, safe_save_model_for_ppo_trainer
-from transformers import GPTQConfig, deepspeed
+from transformers import GenerationConfig
+from vlrlhf.utils.common import safe_save_model_for_ppo_trainer
+from vlrlhf.utils.vision_utils import get_vision_tower
+from transformers import GPTQConfig
+try:
+    from transformers.integrations.deepspeed import HfDeepSpeedConfig
+except Exception:
+    # fallback for older Transformers (<4.56)
+    from transformers.deepspeed import HfDeepSpeedConfig  # type: ignore
+
 from loguru import logger
 import trl
 from transformers.utils import is_torch_tf32_available
 from copy import deepcopy
+from vlrlhf.rewards.numeric_closeness import NumericClosenessRewarder
 
 
 # transformers.logging.set_verbosity_info()
 # Define and parse arguments.
+
+@dataclass
+class RewardArguments:
+    reward_type: Optional[str] = field(default=None, metadata={"help": "numeric_closeness or model"})
+    reward_metric: Optional[str] = field(default="l2", metadata={"help": "l1 or l2"})
+
 @dataclass
 class ScriptArguments:
     """
@@ -120,8 +134,8 @@ class PPOConfig(trl.PPOConfig):
 
 
 if __name__ == "__main__":
-    parser = HfArgumentParser((ScriptArguments, PPOConfig, LoraArguments))
-    script_args, ppo_config, lora_args = parser.parse_args_into_dataclasses()
+    parser = HfArgumentParser((ScriptArguments, PPOConfig, LoraArguments, RewardArguments))
+    script_args, ppo_config, lora_args, reward_args = parser.parse_args_into_dataclasses()
     compute_dtype = torch.float16 if ppo_config.fp16 else (torch.bfloat16 if ppo_config.bf16 else torch.float32)
 
     config = transformers.AutoConfig.from_pretrained(
@@ -150,14 +164,30 @@ if __name__ == "__main__":
         )
     if script_args.reward_adapter is not None and script_args.reward_model_name_or_path is not None:
         raise ValueError("You can only use one of reward_adapter and reward_model")
+    
+    use_functional_reward = (getattr(reward_args, "reward_type", None) == "numeric_closeness")
+
+    if use_functional_reward and (script_args.reward_model_name_or_path or script_args.reward_adapter):
+        raise ValueError("Using --reward_type numeric_closeness; remove --reward_model_name_or_path / --reward_adapter")
+
     reward_model = None
-    if script_args.reward_model_name_or_path is not None:
+
+    if use_functional_reward:
+        # build the pure-function rewarder (drop-in where a model is expected)
+        reward_model = NumericClosenessRewarder(
+            metric=reward_args.reward_metric,                 # "l1" or "l2"
+        )
+    elif script_args.reward_model_name_or_path is not None:
         reward_model = MyAutoRewardModel.from_pretrained(script_args.reward_model_name_or_path)
         reward_model.requires_grad_(False)
+    # else: reward_model stays None to use adapter (if provided) or whatever your core trainer does
+
+
     model = MyAutoModelWithValueHead.from_pretrained(
         script_args.model_name_or_path,
         config=config,
         device_map=device_map,
+        trust_remote_code=True,
         quantization_config=(
             GPTQConfig(bits=lora_args.bits, disable_exllama=True) if ppo_config.use_lora and lora_args.q_lora else None
         ),
@@ -184,13 +214,13 @@ if __name__ == "__main__":
             name for name, buffer in model.named_buffers() if buffer.dtype == torch.bool
         ]
 
-    processor = MyAutoProcessor.from_pretrained(script_args.model_name_or_path)
+    processor = MyAutoProcessor.from_pretrained(script_args.model_name_or_path,trust_remote_code=True)
 
     processor.train()
 
     local_rank = ppo_config.local_rank
     dataset = build_dataset_from_vlquery_json(local_rank, script_args.data_dir, script_args.image_root)
-    generation_config = MyAutoGenerationConfig.from_pretrained(script_args.model_name_or_path)
+    generation_config = GenerationConfig.from_pretrained(script_args.model_name_or_path)
     # ? generation_config may need to be modified for ppo
     generation_config.top_p = 1.0
     if ppo_config.max_new_tokens is not None:
@@ -204,6 +234,7 @@ if __name__ == "__main__":
         config=ppo_config,
         model=model,
         ref_model=None,
+        reward_model=reward_model,
         processor=processor,
         dataset=dataset,
         data_collator=data_collator,

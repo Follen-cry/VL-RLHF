@@ -1,14 +1,16 @@
 compute_environment: LOCAL_MACHINE
 distributed_type: MULTI_GPU
-downcast_bf16: 'no'
-machine_rank: 0
-main_training_function: main
-mixed_precision: bf16
-num_machines: 1
-num_processes: 4
-rdzv_backend: static
-same_network: true
-tpu_env: []
-tpu_use_cluster: false
-tpu_use_sudo: false
+mixed_precision: bf16          # A40 supports bf16 well
+downcast_bf16: "no"
 use_cpu: false
+
+num_machines: 1
+machine_rank: 0
+num_processes: 4               # = number of GPUs in the node
+gpu_ids: all                   # (optional) lets accelerate detect GPUs
+same_network: true
+
+rdzv_backend: static
+main_training_function: main
+# Avoid port clashes when multiple jobs on same host:
+main_process_port: 29501

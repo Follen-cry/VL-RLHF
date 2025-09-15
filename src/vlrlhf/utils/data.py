@@ -90,7 +90,11 @@ def build_dataset_from_vlquery_json(script_args):
 
     def gen():
         for data in raw_data:
-            data["img_path"] = os.path.join(image_root, data["image"])
+            rel_path = data["image"]                         # e.g. "Aesthetics/0001.jpg"
+            data["img_path"] = os.path.join(image_root, rel_path)
+            data["rel_path"] = rel_path
+            # add a unified numeric target field (keep your original `score` too)
+            data["target_value"] = float(data["score"])
             yield data
 
     with PartialState().local_main_process_first():
